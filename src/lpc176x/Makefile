@@ -7,7 +7,7 @@ dirs-y += src/lpc176x src/generic lib/lpc176x/device
 
 CFLAGS += -mthumb -mcpu=cortex-m3 -Ilib/lpc176x/device -Ilib/cmsis-core
 
-CFLAGS_klipper.elf += --specs=nano.specs --specs=nosys.specs
+CFLAGS_klipper.elf += -nostdlib -lgcc -lc_nano
 CFLAGS_klipper.elf += -T $(OUT)src/generic/armcm_link.ld
 $(OUT)klipper.elf: $(OUT)src/generic/armcm_link.ld
 
@@ -35,5 +35,3 @@ $(OUT)klipper.bin: $(OUT)klipper.elf
 flash: $(OUT)klipper.bin
 	@echo "  Flashing $< to $(FLASH_DEVICE)"
 	$(Q)$(PYTHON) ./scripts/flash_usb.py -t $(CONFIG_MCU) -d "$(FLASH_DEVICE)" $(if $(NOSUDO),--no-sudo) $(OUT)klipper.bin
-
-include src/lpc176x/t5uid1/Makefile

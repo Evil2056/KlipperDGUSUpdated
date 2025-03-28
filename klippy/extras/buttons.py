@@ -1,6 +1,6 @@
 # Support for button detection and callbacks
 #
-# Copyright (C) 2018  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2018-2023  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
@@ -57,10 +57,9 @@ class MCU_buttons:
     def handle_buttons_state(self, params):
         # Expand the message ack_count from 8-bit
         ack_count = self.ack_count
-        ack_diff = (ack_count - params['ack_count']) & 0xff
-        if ack_diff & 0x80:
-            ack_diff -= 0x100
-        msg_ack_count = ack_count - ack_diff
+        ack_diff = (params['ack_count'] - ack_count) & 0xff
+        ack_diff -= (ack_diff & 0x80) << 1
+        msg_ack_count = ack_count + ack_diff
         # Determine new buttons
         buttons = bytearray(params['state'])
         new_count = msg_ack_count + len(buttons) - self.ack_count
@@ -70,17 +69,17 @@ class MCU_buttons:
         # Send ack to MCU
         self.ack_cmd.send([self.oid, new_count])
         self.ack_count += new_count
-        # Call self.handle_button() with this event in main thread
-        for nb in new_buttons:
-            self.reactor.register_async_callback(
-                (lambda e, s=self, b=nb: s.handle_button(e, b)))
-    def handle_button(self, eventtime, button):
-        button ^= self.invert
-        changed = button ^ self.last_button
-        for mask, shift, callback in self.callbacks:
-            if changed & mask:
-                callback(eventtime, (button & mask) >> shift)
-        self.last_button = button
+        # Invoke callbacks with this event in main thread
+        btime = params['#receive_time']
+        for button in new_buttons:
+            button ^= self.invert
+            changed = button ^ self.last_button
+            self.last_button = button
+            for mask, shift, callback in self.callbacks:
+                if changed & mask:
+                    state = (button & mask) >> shift
+                    self.reactor.register_async_callback(
+                        (lambda et, c=callback, bt=btime, s=state: c(bt, s)))
 
 
 ######################################################################
@@ -105,7 +104,7 @@ class MCU_ADC_buttons:
         self.max_value = 0.
         ppins = printer.lookup_object('pins')
         self.mcu_adc = ppins.setup_pin('adc', self.pin)
-        self.mcu_adc.setup_minmax(ADC_SAMPLE_TIME, ADC_SAMPLE_COUNT)
+        self.mcu_adc.setup_adc_sample(ADC_SAMPLE_TIME, ADC_SAMPLE_COUNT)
         self.mcu_adc.setup_adc_callback(ADC_REPORT_TIME, self.adc_callback)
         query_adc = printer.lookup_object('query_adc')
         query_adc.register_adc('adc_button:' + pin.strip(), self.mcu_adc)
@@ -245,6 +244,33 @@ class HalfStepRotaryEncoder(BaseRotaryEncoder):
          BaseRotaryEncoder.R_START | BaseRotaryEncoder.R_DIR_CCW),
     )
 
+class DebounceButton:
+    def __init__(self, config, button_action):
+        self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
+        self.button_action = button_action
+        self.debounce_delay = config.getfloat('debounce_delay', 0., minval=0.)
+        self.logical_state = None
+        self.physical_state = None
+        self.latest_eventtime = None
+    def button_handler(self, eventtime, state):
+        self.physical_state = state
+        self.latest_eventtime = eventtime
+        # if there would be no state transition, ignore the event:
+        if self.logical_state == self.physical_state:
+            return
+        trigger_time = eventtime + self.debounce_delay
+        self.reactor.register_callback(self._debounce_event, trigger_time)
+    def _debounce_event(self, eventtime):
+        # if there would be no state transition, ignore the event:
+        if self.logical_state == self.physical_state:
+            return
+        # if there were more recent events, they supersede this one:
+        if (eventtime - self.debounce_delay) < self.latest_eventtime:
+            return
+        # enact state transition and trigger action
+        self.logical_state = self.physical_state
+        self.button_action(self.latest_eventtime, self.logical_state)
 
 ######################################################################
 # Button registration code
@@ -262,6 +288,14 @@ class PrinterButtons:
             self.adc_buttons[pin] = adc_buttons = MCU_ADC_buttons(
                 self.printer, pin, pullup)
         adc_buttons.setup_button(min_val, max_val, callback)
+    def register_debounce_button(self, pin, callback, config):
+        debounce = DebounceButton(config, callback)
+        return self.register_buttons([pin], debounce.button_handler)
+    def register_debounce_adc_button(self, pin, min_val, max_val, pullup
+                                     , callback, config):
+        debounce = DebounceButton(config, callback)
+        return self.register_adc_button(pin, min_val, max_val, pullup
+                                        , debounce.button_handler)
     def register_adc_button_push(self, pin, min_val, max_val, pullup, callback):
         def helper(eventtime, state, callback=callback):
             if state:
